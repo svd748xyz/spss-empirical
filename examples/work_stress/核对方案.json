@@ -1,0 +1,20 @@
+{
+  "title": "核对原总分",
+  "data_file": "data.csv",
+  "methods_note": "核对对方报告：使用数据文件中原有总分，不重新计算题项均值。",
+  "variables": [
+    {"name": "性别", "label": "性别", "values": {"0": "男", "1": "女"}},
+    {"name": "年级", "label": "年级"}
+  ],
+  "analyses": [
+    {"type": "descriptives", "vars": ["工作压力", "心理资本", "职业倦怠"]},
+    {"type": "reliability", "scale": "工作压力", "items": ["压力1", "压力2", "压力3", "压力4"]},
+    {"type": "efa", "items": ["压力1", "压力2", "压力3", "压力4", "资本1", "资本2", "资本3", "资本4"]},
+    {"type": "harman", "items": ["压力1", "压力2", "压力3", "压力4", "资本1", "资本2", "资本3", "资本4", "倦怠1", "倦怠2", "倦怠3", "倦怠4"]},
+    {"type": "correlation", "vars": ["工作压力", "心理资本", "职业倦怠"]},
+    {"type": "ttest", "group": "性别", "codes": [0, 1], "outcomes": ["职业倦怠"]},
+    {"type": "anova", "factor": "年级", "outcomes": ["职业倦怠"]},
+    {"type": "regression", "dependent": "职业倦怠", "blocks": [["工作压力", "心理资本"]]},
+    {"type": "mediation", "x": "工作压力", "m": "心理资本", "y": "职业倦怠", "controls": []}
+  ]
+}

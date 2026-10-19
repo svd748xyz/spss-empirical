@@ -1,0 +1,9 @@
+__pycache__/
+.cursor/skills/spss-empirical/package_root.txt
+.cursor/skills/spss-empirical/python_exe.txt
+*.pyc
+.venv/
+_probe/
+examples/demo_questionnaire/spss_output/
+examples/work_stress/spss_output/
+examples/**/实证分析报告.docx

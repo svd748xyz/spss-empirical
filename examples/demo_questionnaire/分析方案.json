@@ -1,0 +1,35 @@
+{
+  "title": "社会支持、焦虑、抑郁与学业满意度的实证分析",
+  "data_file": "data.csv",
+  "methods_note": "以在校大学生问卷为样本，考察社会支持、焦虑、抑郁与学业满意度的关系。性别与年级为分组变量，年龄进入回归时作为控制变量。",
+  "variables": [
+    {"name": "gender", "label": "性别", "values": {"1": "男", "2": "女"}},
+    {"name": "grade", "label": "年级", "values": {"1": "大一", "2": "大二", "3": "大三"}},
+    {"name": "age", "label": "年龄"},
+    {"name": "satisfaction", "label": "学业满意度"}
+  ],
+  "scales": [
+    {"name": "anxiety", "label": "焦虑", "items": ["anx1", "anx2", "anx3", "anx4"]},
+    {"name": "depression", "label": "抑郁", "items": ["dep1", "dep2", "dep3", "dep4"]},
+    {"name": "support", "label": "社会支持", "items": ["sup1", "sup2", "sup3"]}
+  ],
+  "analyses": [
+    {"type": "descriptives", "vars": ["age", "anxiety", "depression", "support", "satisfaction"]},
+    {"type": "reliability", "scale": "anxiety", "items": ["anx1", "anx2", "anx3", "anx4"]},
+    {"type": "reliability", "scale": "depression", "items": ["dep1", "dep2", "dep3", "dep4"]},
+    {"type": "reliability", "scale": "support", "items": ["sup1", "sup2", "sup3"]},
+    {"type": "correlation", "vars": ["anxiety", "depression", "support", "satisfaction"]},
+    {
+      "type": "regression",
+      "dependent": "satisfaction",
+      "blocks": [
+        ["gender", "age"],
+        ["gender", "age", "anxiety", "depression"]
+      ]
+    },
+    {"type": "ttest", "group": "gender", "codes": [1, 2], "outcomes": ["anxiety"]},
+    {"type": "anova", "factor": "grade", "outcomes": ["satisfaction"]},
+    {"type": "mediation", "x": "anxiety", "m": "depression", "y": "satisfaction", "controls": ["gender", "age"]},
+    {"type": "moderation", "x": "anxiety", "w": "support", "y": "satisfaction", "controls": ["gender", "age"]}
+  ]
+}
