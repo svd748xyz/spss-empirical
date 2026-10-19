@@ -25,9 +25,9 @@
 
 ## 能力边界
 
-可以做描述统计、频数、Cronbach's α、探索性因素（含旋转载荷表）、Harman 单因子、±3SD 筛查、Pearson 相关、分层回归、独立样本 t、单因素方差分析、Sobel 中介、中心化调节和简单斜率。
+可以做描述统计、频数、Cronbach's α、探索性因素（含旋转载荷表）、Harman 单因子、±3SD 筛查、Pearson 相关、Spearman 相关、分层回归、二元 logistic 回归、独立样本 t、单因素方差分析、卡方、Mann-Whitney U、Kruskal-Wallis、并行或链式中介的 Sobel 检验、一个或多个调节变量的中心化交互和简单斜率，以及有调节的中介。量表可以含反向题，三分类及以上可以按参照组生成虚拟变量。一次方案只做研究需要的部分，顺序按 `analyses` 排列。
 
-不能做验证性因子、AMOS、结构方程、多层模型、logistic、卡方、非参数、Spearman，也不能做 Hayes PROCESS 或 Bootstrap 置信区间。中介结果不能写成 PROCESS 输出。
+不能做验证性因子、AMOS、结构方程、多层模型，也不能做 Hayes PROCESS 或 Bootstrap 置信区间。中介和有调节的中介不能写成 PROCESS 输出。
 
 ## 项目文件夹
 

@@ -12,15 +12,23 @@ from spss_agent.interpret import (
     anova,
     correlations,
     descriptives,
+    chi_square,
     factor_loadings,
     frequencies,
-    mediation,
+    kruskal,
+    logistic_model,
+    mann_whitney,
+    mediation_paths,
+    moderated_mediation,
     pairwise,
     regression_models,
     reliability,
+    serial_mediation,
+    spearman,
     t_tests,
     variance_share,
 )
+from spss_agent.plan import PlanError, mediator_names, prepare_plan, required_input_columns
 from spss_agent.oms import parse_oms
 from spss_agent.prepare import read_table, write_spss_csv
 from spss_agent.report import build_report, fmt_stat, p_phrase
@@ -39,6 +47,15 @@ def _heading(index: int, title: str) -> str:
     return f"（{mark}）{title}"
 
 
+def _value_maps(plan: dict) -> dict[str, dict[str, str]]:
+    maps = {}
+    for variable in plan.get("variables") or []:
+        values = variable.get("values") or {}
+        if values:
+            maps[variable["name"]] = {str(key): str(label) for key, label in values.items()}
+    return maps
+
+
 def _labels(plan: dict) -> dict[str, str]:
     labels = {}
     for variable in plan.get("variables") or []:
@@ -48,6 +65,28 @@ def _labels(plan: dict) -> dict[str, str]:
         for item in scale.get("items") or []:
             labels.setdefault(item, item)
     return labels
+
+
+def _processing_notes(plan: dict) -> str:
+    notes = []
+    reversed_items = [
+        rev["item"]
+        for scale in plan.get("scales") or []
+        for rev in scale.get("reverse") or []
+        if rev.get("item")
+    ]
+    if reversed_items:
+        notes.append("反向题按最低分加最高分减去原题得分后，再计入所属量表的题项均分。")
+    dummy_bits = []
+    for variable in plan.get("variables") or []:
+        if not variable.get("dummies"):
+            continue
+        label = variable.get("label") or variable["name"]
+        ref = variable.get("reference_label") or variable.get("reference")
+        dummy_bits.append(f"{label}以{ref}为参照组")
+    if dummy_bits:
+        notes.append("分类变量生成虚拟变量后进入相应模型：" + "；".join(dummy_bits) + "。")
+    return "".join(notes)
 
 
 def _resolve_data(project: Path, plan: dict) -> Path:
@@ -64,25 +103,59 @@ def _discussion(sections: list[dict], labels: dict[str, str]) -> list[str]:
     for section in sections:
         kind = section["kind"]
         if kind == "reliability" and (section.get("result") or {}).get("alpha") is not None:
-            alpha = section["result"]["alpha"]
-            name = labels.get(section.get("scale"), "量表")
-            level = "达到常用的 .70 参考线" if alpha >= 0.70 else "低于常用的 .70 参考线"
-            lines.append(f"{name}的内部一致性系数{level}，是否保留题项应结合内容效度和 CITC，而不是只看这一次 α。")
-        elif kind == "correlation":
+            continue
+        elif kind in {"correlation", "spearman"}:
             notable = [pair for pair in section.get("pairs") or [] if pair.get("p") is not None and pair["p"] < 0.05]
-            lines.append(f"在报告的相关对子中，有 {len(notable)} 对达到 .05 水平。未达到该水平的相关不解释为效应不存在。")
-        elif kind == "regression":
-            model = (section.get("models") or [{}])[-1]
-            if model.get("p") is not None:
-                flag = "整体检验达到 .05 水平" if model["p"] < 0.05 else "整体检验未达到 .05 水平"
-                lines.append(f"回归模型{flag}，R² = {fmt_stat(model.get('r2'), 3, True)}。系数方向只在本次样本和控制变量设定下成立。")
-        elif kind == "mediation":
+            lines.append(f"在报告的相关对子中，有 {len(notable)} 对达到 0.05 水平。未达到该水平的相关不解释为效应不存在。")
+        elif kind == "chisq":
             result = section.get("result") or {}
             if result.get("p") is not None:
                 flag = "达到" if result["p"] < 0.05 else "未达到"
-                lines.append(f"Sobel 检验{flag} .05 水平（{p_phrase(result.get('p'))}）。这不是因果中介的证明，也没有给出 Bootstrap 区间。")
+                lines.append(f"Pearson 卡方{flag} 0.05 水平（{p_phrase(result.get('p'))}）。这不表示单元格之间的方向。")
+        elif kind == "logistic":
+            result = section.get("result") or {}
+            if result.get("p") is not None:
+                flag = "达到" if result["p"] < 0.05 else "未达到"
+                lines.append(f"二元 logistic 模型的总体检验{flag} 0.05 水平（{p_phrase(result.get('p'))}）。系数解释为对数发生比，不是线性回归的单位变化。")
+        elif kind == "regression":
+            model = (section.get("models") or [{}])[-1]
+            if model.get("p") is not None:
+                flag = "整体检验达到 0.05 水平" if model["p"] < 0.05 else "整体检验未达到 0.05 水平"
+                lines.append(f"回归模型{flag}，R² = {fmt_stat(model.get('r2'), 3)}。系数方向只在本次样本和控制变量设定下成立。")
+        elif kind == "mediation":
+            result = section.get("result") or {}
+            paths = result.get("paths") or []
+            bits = []
+            for path in paths:
+                if path.get("p") is None:
+                    continue
+                if path.get("mediators"):
+                    name = "→".join(labels.get(item, item) for item in path["mediators"])
+                else:
+                    name = labels.get(path.get("m"), path.get("m") or "")
+                flag = "达到" if path["p"] < 0.05 else "未达到"
+                subject = f"{name}的特定间接效应" if len(paths) > 1 and name else "Sobel 检验"
+                bits.append(f"{subject}{flag} 0.05 水平（{p_phrase(path.get('p'))}）")
+            if bits:
+                extra = "各条分开报告，没有加总为总间接效应。" if len(paths) > 1 else ""
+                lines.append("；".join(bits) + "。" + extra + "这不是因果中介的证明，也没有给出 Bootstrap 区间。")
         elif kind == "moderation":
             lines.append("调节结论只依据交互项和简单斜率的 SPSS 系数；若交互项不显著，不再把简单斜率解释成调节成立。")
+        elif kind == "moderated_mediation":
+            lines.append("有调节的中介只报告各水平上的条件间接效应和 Sobel 检验。这不是因果结论，也没有 Bootstrap 置信区间。")
+        elif kind in {"mannwhitney", "kruskal"}:
+            lines.append("非参数检验比较的是秩，不报告均值差。")
+    alphas = []
+    for section in sections:
+        if section.get("kind") != "reliability":
+            continue
+        alpha = (section.get("result") or {}).get("alpha")
+        if alpha is None:
+            continue
+        name = labels.get(section.get("scale"), "量表")
+        alphas.append(f"{name} {fmt_stat(alpha, 3)}")
+    if alphas:
+        lines.insert(0, "内部一致性方面，" + "、".join(alphas) + "。α 达到 0.70 可作后续分析；低于 0.70 时需结合题项内容解释，不能只凭这一次系数删题。")
     lines.append("讨论只复述本次输出。横断问卷不能据此主张因果，未检验的假设也不在这里补写。")
     return lines
 
@@ -90,9 +163,7 @@ def _discussion(sections: list[dict], labels: dict[str, str]) -> list[str]:
 def run_plan(project: Path, plan_path: Path, timeout: int = 600) -> Path:
     project = project.resolve()
     plan_path = plan_path.resolve()
-    plan = json.loads(plan_path.read_text(encoding="utf-8"))
-    if "analyses" not in plan or "data_file" not in plan:
-        raise ValueError("分析方案至少要包含 data_file 和 analyses。")
+    plan = prepare_plan(json.loads(plan_path.read_text(encoding="utf-8")))
     data_path = _resolve_data(project, plan)
     plan = {**plan, "data_file": str(data_path)}
     install = detect_spss(plan.get("spss_exe"))
@@ -106,6 +177,9 @@ def run_plan(project: Path, plan_path: Path, timeout: int = 600) -> Path:
     n_rows = None
     if data_path.suffix.lower() != ".sav":
         frame = read_table(data_path, plan.get("sheet"))
+        missing = sorted(required_input_columns(plan) - set(map(str, frame.columns)))
+        if missing:
+            raise PlanError([f"数据里没有这些列：{'、'.join(missing)}"])
         n_rows = int(len(frame))
         prepared_csv = run_dir / "prepared_data.csv"
         frame, renames = write_spss_csv(frame, prepared_csv)
@@ -131,6 +205,7 @@ def run_plan(project: Path, plan_path: Path, timeout: int = 600) -> Path:
     return_code = run_production(install, spj_path, timeout=timeout)
     messages = viewer_messages(viewer_path)
     labels = _labels(plan)
+    value_maps = _value_maps(plan)
     grouped: dict[int, list[dict]] = {}
     for block in job.blocks:
         block["parsed"] = parse_oms(Path(block["oms"]))
@@ -144,7 +219,8 @@ def run_plan(project: Path, plan_path: Path, timeout: int = 600) -> Path:
         if kind == "frequencies":
             sections.append({
                 "kind": kind,
-                "heading": _heading(offset, "人口学频数"),
+                "heading": _heading(offset, "基本资料"),
+                "vars": analysis.get("vars") or [],
                 "rows": frequencies(blocks[0]["parsed"]) if blocks else [],
             })
         elif kind == "descriptives":
@@ -175,6 +251,7 @@ def run_plan(project: Path, plan_path: Path, timeout: int = 600) -> Path:
             sections.append({
                 "kind": kind,
                 "heading": _heading(offset, "独立样本 t 检验"),
+                "group": analysis.get("group"),
                 "results": t_tests(blocks[0]["parsed"]) if blocks else [],
             })
         elif kind == "anova":
@@ -182,6 +259,7 @@ def run_plan(project: Path, plan_path: Path, timeout: int = 600) -> Path:
             sections.append({
                 "kind": kind,
                 "heading": _heading(offset, "单因素方差分析"),
+                "factor": analysis.get("factor"),
                 "results": anova(parsed),
                 "pairs": pairwise(parsed),
                 "outcomes": analysis.get("outcomes") or [],
@@ -209,17 +287,113 @@ def run_plan(project: Path, plan_path: Path, timeout: int = 600) -> Path:
                 row["name"] = mapping.get(row["name"], row["name"])
             sections.append({"kind": kind, "heading": _heading(offset, "极端值筛查"), "rows": rows})
         elif kind == "mediation":
-            by_step = {block["meta"].get("step"): block["parsed"] for block in blocks}
+            a_by_m = {}
+            c_cells: list = []
+            b_cells: list = []
+            for block in blocks:
+                step = block["meta"].get("step")
+                if step == "a":
+                    a_by_m[block["meta"].get("mediator")] = block["parsed"]
+                elif step == "c":
+                    c_cells = block["parsed"]
+                elif step == "b":
+                    b_cells = block["parsed"]
+            mediators = mediator_names(analysis)
+            structure = analysis.get("structure") or "parallel"
+            result = (
+                serial_mediation(a_by_m, c_cells, b_cells, analysis["x"], mediators)
+                if structure == "serial"
+                else mediation_paths(a_by_m, c_cells, b_cells, analysis["x"], mediators)
+            )
             sections.append({
                 "kind": kind,
-                "heading": _heading(offset, "中介效应"),
+                "heading": _heading(offset, "链式中介" if structure == "serial" else "中介效应"),
+                "x": analysis["x"],
+                "m": mediators,
+                "y": analysis["y"],
+                "structure": structure,
+                "result": result,
+            })
+        elif kind == "spearman":
+            sections.append({
+                "kind": kind,
+                "heading": _heading(offset, "Spearman 相关"),
+                "pairs": spearman(blocks[0]["parsed"]) if blocks else [],
+            })
+        elif kind == "chisq":
+            sections.append({
+                "kind": kind,
+                "heading": _heading(offset, "卡方检验"),
+                "row": analysis.get("row"),
+                "col": analysis.get("col"),
+                "row_values": value_maps.get(analysis.get("row"), {}),
+                "col_values": value_maps.get(analysis.get("col"), {}),
+                "result": chi_square(blocks[0]["parsed"]) if blocks else {},
+            })
+        elif kind == "mannwhitney":
+            sections.append({
+                "kind": kind,
+                "heading": _heading(offset, "Mann-Whitney U 检验"),
+                "group": analysis.get("group"),
+                "group_values": value_maps.get(analysis.get("group"), {}),
+                "results": mann_whitney(blocks[0]["parsed"]) if blocks else [],
+            })
+        elif kind == "kruskal":
+            sections.append({
+                "kind": kind,
+                "heading": _heading(offset, "Kruskal-Wallis 检验"),
+                "factor": analysis.get("factor"),
+                "group_values": value_maps.get(analysis.get("factor"), {}),
+                "results": kruskal(blocks[0]["parsed"]) if blocks else [],
+            })
+        elif kind == "logistic":
+            sections.append({
+                "kind": kind,
+                "heading": _heading(offset, "二元 logistic 回归"),
+                "dependent": analysis.get("dependent"),
+                "result": logistic_model(blocks[0]["parsed"]) if blocks else {},
+            })
+        elif kind == "moderated_mediation":
+            sections.append({
+                "kind": kind,
+                "heading": _heading(offset, "有调节的中介"),
                 "x": analysis["x"],
                 "m": analysis["m"],
                 "y": analysis["y"],
-                "result": mediation(by_step.get("a", []), by_step.get("c", []), by_step.get("b", []), analysis["x"], analysis["m"]),
+                "w": analysis["w"],
+                "stage": analysis.get("stage"),
+                "result": moderated_mediation(blocks, analysis.get("stage"), analysis["m"], analysis["x"]),
             })
         elif kind == "moderation":
             by_step = {block["meta"].get("step"): block for block in blocks}
+            if isinstance(analysis.get("w"), list):
+                main_block = by_step.get("main")
+                groups = []
+                if main_block:
+                    labels[main_block["meta"]["x_c"]] = labels.get(analysis["x"], analysis["x"]) + "（中心化）"
+                    for item in main_block["meta"].get("moderators") or []:
+                        labels[item["w_c"]] = labels.get(item["name"], item["name"]) + "（中心化）"
+                        labels[item["xw"]] = labels.get(analysis["x"], analysis["x"]) + " × " + labels.get(item["name"], item["name"])
+                for offset_w, moderator in enumerate(analysis["w"]):
+                    high_block = by_step.get(f"high_{offset_w}")
+                    low_block = by_step.get(f"low_{offset_w}")
+                    groups.append({
+                        "name": moderator,
+                        "interaction": high_block["meta"]["interaction"] if high_block else "",
+                        "slope_var": high_block["meta"]["slope_var"] if high_block else "",
+                        "high": regression_models(high_block["parsed"]) if high_block else [],
+                        "low": regression_models(low_block["parsed"]) if low_block else [],
+                    })
+                sections.append({
+                    "kind": kind,
+                    "heading": _heading(offset, "调节效应"),
+                    "x": analysis["x"],
+                    "w": analysis["w"],
+                    "y": analysis["y"],
+                    "groups": groups,
+                    "main": regression_models(main_block["parsed"]) if main_block else [],
+                })
+                continue
             main_block = by_step.get("main")
             high_block = by_step.get("high")
             low_block = by_step.get("low")
@@ -243,6 +417,7 @@ def run_plan(project: Path, plan_path: Path, timeout: int = 600) -> Path:
     methods = plan.get("methods_note") or "使用者确认的研究问题见分析方案。"
     if n_rows is not None:
         methods += f"导入的数据共 {n_rows} 行。"
+    methods += _processing_notes(plan)
     report_path = run_dir / "实证分析报告.docx"
     payload = {
         "title": plan.get("title") or "问卷实证分析报告",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from spss_agent.plan import mediator_names, moderator_names
 from spss_agent.prepare import infer_formats
 
 
@@ -89,13 +90,22 @@ def build_syntax(plan: dict, data_csv: Path | None, formats: list[tuple[str, str
     job.add("DATASET ACTIVATE source.")
 
     labels = []
+    computed = False
     for scale in plan.get("scales") or []:
+        for rev in scale.get("reverse") or []:
+            computed = True
+            job.add(f"COMPUTE {rev['name']}={rev['low']}+{rev['high']}-{rev['item']}.")
         items = ",".join(scale["items"])
         target = scale["name"]
+        computed = True
         job.add(f"COMPUTE {target}=MEAN({items}).")
         label = scale.get("label") or target
         labels.append(f"  {target} '{_lab(label)}'")
-    if any(plan.get("scales") or []):
+    for variable in plan.get("variables") or []:
+        for dummy in variable.get("dummies") or []:
+            computed = True
+            job.add(f"COMPUTE {dummy['name']}=({variable['name']} = {dummy['code']}).")
+    if computed:
         job.add("EXECUTE.")
     for variable in plan.get("variables") or []:
         if variable.get("label"):
@@ -235,15 +245,74 @@ def build_syntax(plan: dict, data_csv: Path | None, formats: list[tuple[str, str
             job.block(block_id, kind, analysis, _regression_body(analysis["dependent"], analysis["blocks"]))
         elif kind == "mediation":
             controls = analysis.get("controls") or []
-            x, m, y = analysis["x"], analysis["m"], analysis["y"]
-            job.block(f"{block_id}_a", "regression", {**analysis, "step": "a"}, _regression_body(m, [[x, *controls]]))
+            x, y = analysis["x"], analysis["y"]
+            mediators = mediator_names(analysis)
+            structure = analysis.get("structure") or "parallel"
+            for offset, mediator in enumerate(mediators, start=1):
+                step_id = f"{block_id}_a" if len(mediators) == 1 else f"{block_id}_a{offset}"
+                predictors = [x, *mediators[: offset - 1], *controls] if structure == "serial" else [x, *controls]
+                job.block(
+                    step_id,
+                    "regression",
+                    {**analysis, "step": "a", "mediator": mediator},
+                    _regression_body(mediator, [predictors]),
+                )
             job.block(f"{block_id}_c", "regression", {**analysis, "step": "c"}, _regression_body(y, [[x, *controls]]))
             job.block(
                 f"{block_id}_b",
                 "regression",
-                {**analysis, "step": "b"},
-                _regression_body(y, [[x, m, *controls]]),
+                {**analysis, "step": "b", "mediators": mediators},
+                _regression_body(y, [[x, *mediators, *controls]]),
             )
+        elif kind == "spearman":
+            job.block(
+                block_id,
+                kind,
+                analysis,
+                "NONPAR CORR\n"
+                f"  /VARIABLES={_vars(analysis['vars'])}\n"
+                "  /PRINT=SPEARMAN TWOTAIL NOSIG\n"
+                "  /MISSING=PAIRWISE.",
+            )
+        elif kind == "chisq":
+            job.block(
+                block_id,
+                kind,
+                analysis,
+                f"CROSSTABS\n  /TABLES={analysis['row']} BY {analysis['col']}\n  /STATISTICS=CHISQ\n  /CELLS=COUNT.",
+            )
+        elif kind == "mannwhitney":
+            group = analysis["group"]
+            codes = analysis.get("codes") or [1, 2]
+            job.block(
+                block_id,
+                kind,
+                analysis,
+                "NPAR TESTS\n"
+                f"  /M-W={_vars(analysis['outcomes'])} BY {group}({codes[0]} {codes[1]}).",
+            )
+        elif kind == "kruskal":
+            codes = analysis["codes"]
+            job.block(
+                block_id,
+                kind,
+                analysis,
+                "NPAR TESTS\n"
+                f"  /K-W={_vars(analysis['outcomes'])} BY {analysis['factor']}({codes[0]} {codes[1]}).",
+            )
+        elif kind == "logistic":
+            job.block(
+                block_id,
+                kind,
+                analysis,
+                "LOGISTIC REGRESSION " + analysis["dependent"] + "\n"
+                f"  WITH {_vars(analysis['predictors'])}\n"
+                "  /METHOD=ENTER.",
+            )
+        elif kind == "moderated_mediation":
+            _add_moderated_mediation(job, analysis, index, block_id)
+        elif kind == "moderation" and isinstance(analysis.get("w"), list):
+            _add_multiple_moderation(job, analysis, index, block_id)
         elif kind == "moderation":
             x, w, y = analysis["x"], analysis["w"], analysis["y"]
             controls = analysis.get("controls") or []
@@ -285,6 +354,153 @@ def build_syntax(plan: dict, data_csv: Path | None, formats: list[tuple[str, str
         else:
             raise ValueError(f"分析方案含未实现的类型：{kind}")
     return job
+
+
+def _add_multiple_moderation(job: SyntaxJob, analysis: dict, index: int, block_id: str) -> None:
+    x, y = analysis["x"], analysis["y"]
+    moderators = moderator_names(analysis)
+    controls = analysis.get("controls") or []
+    dummy = f"d_{index}"
+    xc = f"xc_{index}"
+    specs = []
+    aggregate = [
+        f"COMPUTE {dummy}=1.",
+        "AGGREGATE",
+        "  /OUTFILE=* MODE=ADDVARIABLES",
+        f"  /BREAK={dummy}",
+        f"  /xm_{index}=MEAN({x})",
+    ]
+    for offset, moderator in enumerate(moderators):
+        aggregate.append(f"  /wm_{index}_{offset}=MEAN({moderator})")
+        aggregate.append(f"  /ws_{index}_{offset}=SD({moderator})")
+    job.add("\n".join(aggregate) + ".")
+    job.add(f"COMPUTE {xc}={x}-xm_{index}.")
+    for offset, moderator in enumerate(moderators):
+        wc = f"wc_{index}_{offset}"
+        xw = f"xw_{index}_{offset}"
+        wh = f"wh_{index}_{offset}"
+        wl = f"wl_{index}_{offset}"
+        xwh = f"xwh_{index}_{offset}"
+        xwl = f"xwl_{index}_{offset}"
+        job.add(f"COMPUTE {wc}={moderator}-wm_{index}_{offset}.")
+        job.add(f"COMPUTE {xw}={xc}*{wc}.")
+        job.add(f"COMPUTE {wh}={wc}-ws_{index}_{offset}.")
+        job.add(f"COMPUTE {wl}={wc}+ws_{index}_{offset}.")
+        job.add(f"COMPUTE {xwh}={xc}*{wh}.")
+        job.add(f"COMPUTE {xwl}={xc}*{wl}.")
+        specs.append({"name": moderator, "w_c": wc, "xw": xw, "wh": wh, "wl": wl, "xwh": xwh, "xwl": xwl})
+    job.add("EXECUTE.")
+    base = [xc, *[item["w_c"] for item in specs], *controls]
+    interactions = [item["xw"] for item in specs]
+    job.block(
+        f"{block_id}_main",
+        "regression",
+        {**analysis, "step": "main", "x_c": xc, "moderators": [{"name": item["name"], "w_c": item["w_c"], "xw": item["xw"]} for item in specs]},
+        _regression_body(y, [base, [*base, *interactions]]),
+    )
+    for offset, item in enumerate(specs):
+        high = [xc]
+        low = [xc]
+        for other in specs:
+            if other is item:
+                high.extend([item["wh"], item["xwh"]])
+                low.extend([item["wl"], item["xwl"]])
+            else:
+                high.extend([other["w_c"], other["xw"]])
+                low.extend([other["w_c"], other["xw"]])
+        shared = {**analysis, "moderator": item["name"], "slope_var": xc, "interaction": item["xw"]}
+        job.block(f"{block_id}_high_{offset}", "regression", {**shared, "step": f"high_{offset}"}, _regression_body(y, [[*high, *controls]]))
+        job.block(f"{block_id}_low_{offset}", "regression", {**shared, "step": f"low_{offset}"}, _regression_body(y, [[*low, *controls]]))
+
+
+def _center(job: SyntaxJob, index: int, x: str | None, m: str | None, w: str) -> dict:
+    dummy = f"dmm_{index}"
+    names = {"w": w, "wc": f"mmw_{index}", "wh": f"mmwh_{index}", "wl": f"mmwl_{index}"}
+    aggregate = [f"COMPUTE {dummy}=1.", "AGGREGATE", "  /OUTFILE=* MODE=ADDVARIABLES", f"  /BREAK={dummy}", f"  /mmwm_{index}=MEAN({w})", f"  /mmws_{index}=SD({w})"]
+    if x:
+        aggregate.append(f"  /mmxm_{index}=MEAN({x})")
+        names["x"] = x
+        names["xc"] = f"mmx_{index}"
+    if m:
+        aggregate.append(f"  /mmmm_{index}=MEAN({m})")
+        names["m"] = m
+        names["mc"] = f"mmm_{index}"
+    job.add("\n".join(aggregate) + ".")
+    job.add(f"COMPUTE {names['wc']}={w}-mmwm_{index}.")
+    job.add(f"COMPUTE {names['wh']}={names['wc']}-mmws_{index}.")
+    job.add(f"COMPUTE {names['wl']}={names['wc']}+mmws_{index}.")
+    if x:
+        names["xw"] = f"mmxw_{index}"
+        names["xwh"] = f"mmxwh_{index}"
+        names["xwl"] = f"mmxwl_{index}"
+        job.add(f"COMPUTE {names['xc']}={x}-mmxm_{index}.")
+        job.add(f"COMPUTE {names['xw']}={names['xc']}*{names['wc']}.")
+        job.add(f"COMPUTE {names['xwh']}={names['xc']}*{names['wh']}.")
+        job.add(f"COMPUTE {names['xwl']}={names['xc']}*{names['wl']}.")
+    if m:
+        names["mw"] = f"mmmw_{index}"
+        names["mwh"] = f"mmmwh_{index}"
+        names["mwl"] = f"mmmwl_{index}"
+        job.add(f"COMPUTE {names['mc']}={m}-mmmm_{index}.")
+        job.add(f"COMPUTE {names['mw']}={names['mc']}*{names['wc']}.")
+        job.add(f"COMPUTE {names['mwh']}={names['mc']}*{names['wh']}.")
+        job.add(f"COMPUTE {names['mwl']}={names['mc']}*{names['wl']}.")
+    job.add("EXECUTE.")
+    return names
+
+
+def _add_moderated_mediation(job: SyntaxJob, analysis: dict, index: int, block_id: str) -> None:
+    x, m, y, w = analysis["x"], analysis["m"], analysis["y"], analysis["w"]
+    controls = analysis.get("controls") or []
+    stage = analysis["stage"]
+    centered = _center(job, index, x if stage in {"a", "both"} else None, m if stage in {"b", "both"} else None, w)
+    if stage in {"a", "both"}:
+        xc, wc, xw = centered["xc"], centered["wc"], centered["xw"]
+        shared = {"slope_var": xc, "interaction": xw}
+        job.block(
+            f"{block_id}_a_main",
+            "regression",
+            {**analysis, **shared, "step": "a_main"},
+            _regression_body(m, [[xc, wc, xw, *controls]]),
+        )
+        job.block(
+            f"{block_id}_a_high",
+            "regression",
+            {**analysis, **shared, "step": "a_high"},
+            _regression_body(m, [[xc, centered["wh"], centered["xwh"], *controls]]),
+        )
+        job.block(
+            f"{block_id}_a_low",
+            "regression",
+            {**analysis, **shared, "step": "a_low"},
+            _regression_body(m, [[xc, centered["wl"], centered["xwl"], *controls]]),
+        )
+    else:
+        job.block(f"{block_id}_a", "regression", {**analysis, "step": "a"}, _regression_body(m, [[x, *controls]]))
+    if stage == "a":
+        job.block(f"{block_id}_b", "regression", {**analysis, "step": "b"}, _regression_body(y, [[x, m, w, *controls]]))
+    else:
+        mc, wc, mw = centered["mc"], centered["wc"], centered["mw"]
+        shared_b = {"slope_var": mc, "interaction": mw}
+        job.block(
+            f"{block_id}_b_main",
+            "regression",
+            {**analysis, **shared_b, "step": "b_main"},
+            _regression_body(y, [[x, mc, wc, mw, *controls]]),
+        )
+        job.block(
+            f"{block_id}_b_high",
+            "regression",
+            {**analysis, **shared_b, "step": "b_high"},
+            _regression_body(y, [[x, mc, centered["wh"], centered["mwh"], *controls]]),
+        )
+        job.block(
+            f"{block_id}_b_low",
+            "regression",
+            {**analysis, **shared_b, "step": "b_low"},
+            _regression_body(y, [[x, mc, centered["wl"], centered["mwl"], *controls]]),
+        )
+    job.block(f"{block_id}_c", "regression", {**analysis, "step": "c"}, _regression_body(y, [[x, *controls]]))
 
 
 def formats_for(frame) -> list[tuple[str, str]]:

@@ -230,6 +230,7 @@ def anova(cells: list[Cell]) -> list[dict]:
                 "ss_within": lookup(cells, "ANOVA", prefix + ("Within Groups", "Sum of Squares")),
                 "ss_total": lookup(cells, "ANOVA", prefix + ("Total", "Sum of Squares")),
                 "levene_p": lookup(cells, "Test of Homogeneity of Variance", prefix + ("Based on Mean", "Sig.")),
+                "groups": _anova_groups(cells, dep),
             }
         )
     ready = []
@@ -242,6 +243,45 @@ def anova(cells: list[Cell]) -> list[dict]:
     return ready
 
 
+def _same_pivot(cell: Cell, pivot: str) -> bool:
+    return cell.pivot == pivot
+
+
+def _lookup_in_pivot(cells: list[Cell], table: str, pivot: str, parts: tuple[str, ...]) -> float | None:
+    for cell in cells:
+        if cell.table != table or not _same_pivot(cell, pivot) or cell.number is None:
+            continue
+        labels = cell.row + cell.col
+        if all(part in labels for part in parts):
+            return cell.number
+    return None
+
+
+def _anova_groups(cells: list[Cell], outcome: str) -> list[dict]:
+    seen: list[str] = []
+    for cell in tables_of(cells, "Descriptives"):
+        if "Mean" not in cell.col or not cell.row:
+            continue
+        if outcome and outcome not in cell.row:
+            continue
+        group = cell.row[-1]
+        if group in {"", "Total", "总计", outcome} or group in seen:
+            continue
+        seen.append(group)
+    groups = []
+    for group in seen:
+        prefix = (outcome, group) if outcome else (group,)
+        groups.append(
+            {
+                "group": group,
+                "n": lookup(cells, "Descriptives", prefix + ("N",)),
+                "mean": lookup(cells, "Descriptives", prefix + ("Mean",)),
+                "sd": lookup(cells, "Descriptives", prefix + ("Std. Deviation",)),
+            }
+        )
+    return groups
+
+
 def frequencies(cells: list[Cell]) -> list[dict]:
     rows = []
     seen: set[tuple[str, ...]] = set()
@@ -250,11 +290,14 @@ def frequencies(cells: list[Cell]) -> list[dict]:
         if "Frequency" not in path or cell.number is None:
             continue
         raw = tuple(part for part in path if part not in {"Frequency", "Percent", "Valid Percent", "Cumulative Percent"})
-        labels = tuple(part for part in raw if part not in {"Valid", "Missing", "Total", "0", "-1"})
-        if not labels or raw in seen:
+        labels = tuple(part for part in raw if part not in {"Valid", "Missing", "Total", "总计", "0", "-1"})
+        if not labels or any(part in {"Total", "总计"} for part in raw) or raw in seen:
             continue
         seen.add(raw)
-        rows.append({"labels": labels, "n": cell.number, "percent": lookup(cells, "Frequencies", raw + ("Percent",))})
+        percent = _lookup_in_pivot(cells, "Frequencies", cell.pivot, raw + ("Valid Percent",))
+        if percent is None:
+            percent = _lookup_in_pivot(cells, "Frequencies", cell.pivot, raw + ("Percent",))
+        rows.append({"labels": labels, "n": cell.number, "percent": percent, "variable": cell.pivot})
     return rows
 
 
@@ -348,25 +391,314 @@ def sobel(a: float | None, sa: float | None, b: float | None, sb: float | None) 
 
 
 def mediation(a_cells: list[Cell], c_cells: list[Cell], b_cells: list[Cell], x: str, m: str) -> dict:
-    a_models = regression_models(a_cells)
+    return mediation_paths({m: a_cells}, c_cells, b_cells, x, [m])
+
+
+def mediation_paths(
+    a_by_mediator: dict[str, list[Cell]],
+    c_cells: list[Cell],
+    b_cells: list[Cell],
+    x: str,
+    mediators: list[str],
+) -> dict:
     c_models = regression_models(c_cells)
     b_models = regression_models(b_cells)
-    a_model = a_models[-1] if a_models else {}
     c_model = c_models[-1] if c_models else {}
     b_model = b_models[-1] if b_models else {}
-    a_coef = coef(a_model, x) or {}
     c_coef = coef(c_model, x) or {}
-    b_coef = coef(b_model, m) or {}
     c_prime = coef(b_model, x) or {}
-    effect = sobel(a_coef.get("B"), a_coef.get("se"), b_coef.get("B"), b_coef.get("se"))
-    return {
-        "a": a_coef,
-        "b": b_coef,
+    paths = []
+    for mediator in mediators:
+        a_models = regression_models(a_by_mediator.get(mediator) or [])
+        a_model = a_models[-1] if a_models else {}
+        a_coef = coef(a_model, x) or {}
+        b_coef = coef(b_model, mediator) or {}
+        effect = sobel(a_coef.get("B"), a_coef.get("se"), b_coef.get("B"), b_coef.get("se"))
+        paths.append({"m": mediator, "a": a_coef, "b": b_coef, "a_model": a_model, **effect})
+    result = {
+        "paths": paths,
         "c": c_coef,
         "c_prime": c_prime,
-        "a_model": a_model,
         "c_model": c_model,
         "b_model": b_model,
-        **effect,
-        "method": "Baron-Kenny steps plus Sobel test; bootstrap CI was not estimated",
+        "method": "Specific indirect effects use separate Sobel tests; paths were not summed and bootstrap CI was not estimated",
+    }
+    if len(paths) == 1:
+        only = paths[0]
+        result.update(
+            a=only["a"],
+            b=only["b"],
+            a_model=only["a_model"],
+            indirect=only["indirect"],
+            se=only["se"],
+            z=only["z"],
+            p=only["p"],
+        )
+    return result
+
+
+def product_test(parts: list[dict]) -> dict:
+    values = [part.get("B") for part in parts]
+    errors = [part.get("se") for part in parts]
+    if any(value is None for value in values + errors):
+        return {"indirect": None, "se": None, "z": None, "p": None}
+    indirect = 1.0
+    for value in values:
+        indirect *= value
+    variance = 0.0
+    for index, se in enumerate(errors):
+        rest = 1.0
+        for other, value in enumerate(values):
+            if other != index:
+                rest *= value
+        variance += (rest * se) ** 2
+    se = math.sqrt(variance)
+    if se == 0:
+        return {"indirect": indirect, "se": se, "z": None, "p": None}
+    z = indirect / se
+    p = math.erfc(abs(z) / math.sqrt(2))
+    return {"indirect": indirect, "se": se, "z": z, "p": p}
+
+
+def serial_paths(mediators: list[str]) -> list[tuple[str, ...]]:
+    paths = []
+    width = len(mediators)
+    for mask in range(1, 1 << width):
+        paths.append(tuple(mediators[index] for index in range(width) if mask & (1 << index)))
+    return paths
+
+
+def serial_mediation(
+    a_by_mediator: dict[str, list[Cell]],
+    c_cells: list[Cell],
+    b_cells: list[Cell],
+    x: str,
+    mediators: list[str],
+) -> dict:
+    models = {}
+    for mediator in mediators:
+        fitted = regression_models(a_by_mediator.get(mediator) or [])
+        models[mediator] = fitted[-1] if fitted else {}
+    b_fitted = regression_models(b_cells)
+    c_fitted = regression_models(c_cells)
+    b_model = b_fitted[-1] if b_fitted else {}
+    c_model = c_fitted[-1] if c_fitted else {}
+    paths = []
+    for sequence in serial_paths(mediators):
+        parts = [coef(models[sequence[0]], x) or {}]
+        for previous, nxt in zip(sequence, sequence[1:]):
+            parts.append(coef(models[nxt], previous) or {})
+        parts.append(coef(b_model, sequence[-1]) or {})
+        effect = product_test(parts)
+        paths.append({"mediators": list(sequence), **effect})
+    return {
+        "structure": "serial",
+        "paths": paths,
+        "c": coef(c_model, x) or {},
+        "c_prime": coef(b_model, x) or {},
+        "method": "Serial specific indirect effects use the delta-method Sobel test; bootstrap CI was not estimated",
+    }
+
+
+def _last_coef(cells: list[Cell], name: str) -> dict:
+    fitted = regression_models(cells)
+    model = fitted[-1] if fitted else {}
+    return coef(model, name) or {}
+
+
+def moderated_mediation(blocks: list[dict], stage: str, mediator: str, x: str) -> dict:
+    by_step = {block["meta"].get("step"): block for block in blocks}
+
+    def take(step: str, name: str) -> dict:
+        block = by_step.get(step)
+        if block is None:
+            return {}
+        return _last_coef(block["parsed"], name)
+
+    levels = []
+    if stage == "a":
+        b_coef = take("b", mediator)
+        interaction = take("a_main", (by_step.get("a_main") or {}).get("meta", {}).get("interaction", ""))
+        for step, title in (("a_main", "均值"), ("a_high", "高于均值一个标准差"), ("a_low", "低于均值一个标准差")):
+            slope_name = (by_step.get(step) or {}).get("meta", {}).get("slope_var", "")
+            a_coef = take(step, slope_name)
+            levels.append({"level": title, "a": a_coef, "b": b_coef, **product_test([a_coef, b_coef])})
+        index = product_test([interaction, b_coef])
+        interaction_b = None
+    elif stage == "b":
+        a_coef = take("a", x)
+        interaction = take("b_main", (by_step.get("b_main") or {}).get("meta", {}).get("interaction", ""))
+        for step, title in (("b_main", "均值"), ("b_high", "高于均值一个标准差"), ("b_low", "低于均值一个标准差")):
+            slope_name = (by_step.get(step) or {}).get("meta", {}).get("slope_var", "")
+            b_coef = take(step, slope_name)
+            levels.append({"level": title, "a": a_coef, "b": b_coef, **product_test([a_coef, b_coef])})
+        index = product_test([a_coef, interaction])
+        interaction_b = interaction
+        interaction = None
+    else:
+        interaction = take("a_main", (by_step.get("a_main") or {}).get("meta", {}).get("interaction", ""))
+        interaction_b = take("b_main", (by_step.get("b_main") or {}).get("meta", {}).get("interaction", ""))
+        for a_step, b_step, title in (
+            ("a_main", "b_main", "均值"),
+            ("a_high", "b_high", "高于均值一个标准差"),
+            ("a_low", "b_low", "低于均值一个标准差"),
+        ):
+            a_name = (by_step.get(a_step) or {}).get("meta", {}).get("slope_var", "")
+            b_name = (by_step.get(b_step) or {}).get("meta", {}).get("slope_var", "")
+            a_coef = take(a_step, a_name)
+            b_coef = take(b_step, b_name)
+            levels.append({"level": title, "a": a_coef, "b": b_coef, **product_test([a_coef, b_coef])})
+        index = None
+    direct_step = "b" if stage == "a" else "b_main"
+    return {
+        "stage": stage,
+        "levels": levels,
+        "interaction_a": interaction,
+        "interaction_b": interaction_b,
+        "index": index,
+        "c_prime": take(direct_step, x),
+        "c": take("c", x),
+        "method": "Conditional indirect effects use reparameterized SPSS coefficients and a Sobel product test; bootstrap CI was not estimated",
+    }
+
+
+def spearman(cells: list[Cell]) -> list[dict]:
+    pairs = []
+    seen: set[tuple[str, str]] = set()
+    for cell in tables_of(cells, "Correlations"):
+        labels = cell.row + cell.col
+        if "Correlation Coefficient" not in labels or "Spearman's rho" not in labels:
+            continue
+        names = [part for part in labels if part not in {"Spearman's rho", "Correlation Coefficient"}]
+        if len(names) != 2 or names[0] == names[1]:
+            continue
+        key = tuple(sorted(names))
+        if key in seen:
+            continue
+        seen.add(key)
+        left, right = names
+        pairs.append(
+            {
+                "x": left,
+                "y": right,
+                "r": cell.number,
+                "p": lookup(cells, "Correlations", (left, right, "Sig. (2-tailed)")),
+                "n": lookup(cells, "Correlations", (left, right, "N")),
+            }
+        )
+    return pairs
+
+
+def chi_square(cells: list[Cell]) -> dict:
+    counts = []
+    for cell in tables_of(cells, "Crosstabulation"):
+        if cell.number is None or not cell.row or cell.row[0] != "Count":
+            continue
+        if "Total" in cell.row or "Total" in cell.col or len(cell.row) < 3 or len(cell.col) < 2:
+            continue
+        counts.append({"row": cell.row[2], "col": cell.col[1], "n": cell.number})
+    return {
+        "chi2": lookup(cells, "Chi Square Tests", ("Pearson Chi-Square", "Value")),
+        "df": lookup(cells, "Chi Square Tests", ("Pearson Chi-Square", "df")),
+        "p": lookup(cells, "Chi Square Tests", ("Pearson Chi-Square", "Asymptotic Significance (2-sided)")),
+        "n": lookup(cells, "Chi Square Tests", ("N of Valid Cases", "Value")),
+        "counts": counts,
+    }
+
+
+def mann_whitney(cells: list[Cell]) -> list[dict]:
+    outcomes: list[str] = []
+    for cell in tables_of(cells, "Mann Whitney Test Statistics"):
+        if cell.col and cell.col[0] not in outcomes:
+            outcomes.append(cell.col[0])
+    results = []
+    for outcome in outcomes:
+        groups = []
+        seen: list[str] = []
+        for cell in tables_of(cells, "Mann Whitney Ranks"):
+            if len(cell.row) >= 2 and cell.row[0] == outcome and cell.row[1] not in seen and cell.row[1] != "Total":
+                seen.append(cell.row[1])
+        for group in seen:
+            groups.append(
+                {
+                    "group": group,
+                    "n": lookup(cells, "Mann Whitney Ranks", (outcome, group, "N")),
+                    "mean_rank": lookup(cells, "Mann Whitney Ranks", (outcome, group, "Mean Rank")),
+                }
+            )
+        results.append(
+            {
+                "outcome": outcome,
+                "u": lookup(cells, "Mann Whitney Test Statistics", ("Mann-Whitney U", outcome)),
+                "z": lookup(cells, "Mann Whitney Test Statistics", ("Z", outcome)),
+                "p": lookup(cells, "Mann Whitney Test Statistics", ("Asymp. Sig. (2-tailed)", outcome)),
+                "groups": groups,
+            }
+        )
+    return results
+
+
+def kruskal(cells: list[Cell]) -> list[dict]:
+    outcomes: list[str] = []
+    for cell in tables_of(cells, "Kruskal Wallis Test Statistics"):
+        if cell.col and cell.col[0] not in outcomes:
+            outcomes.append(cell.col[0])
+    results = []
+    for outcome in outcomes:
+        groups = []
+        seen: list[str] = []
+        for cell in tables_of(cells, "Kruskal Wallis Ranks"):
+            if len(cell.row) >= 2 and cell.row[0] == outcome and cell.row[1] not in seen and cell.row[1] != "Total":
+                seen.append(cell.row[1])
+        for group in seen:
+            groups.append(
+                {
+                    "group": group,
+                    "n": lookup(cells, "Kruskal Wallis Ranks", (outcome, group, "N")),
+                    "mean_rank": lookup(cells, "Kruskal Wallis Ranks", (outcome, group, "Mean Rank")),
+                }
+            )
+        results.append(
+            {
+                "outcome": outcome,
+                "h": lookup(cells, "Kruskal Wallis Test Statistics", ("Kruskal-Wallis H", outcome)),
+                "df": lookup(cells, "Kruskal Wallis Test Statistics", ("df", outcome)),
+                "p": lookup(cells, "Kruskal Wallis Test Statistics", ("Asymp. Sig.", outcome)),
+                "groups": groups,
+            }
+        )
+    return results
+
+
+def logistic_model(cells: list[Cell]) -> dict:
+    steps: list[str] = []
+    for cell in tables_of(cells, "Variables in the Equation"):
+        if cell.row and cell.row[0].startswith("Step") and cell.row[0] not in steps:
+            steps.append(cell.row[0])
+    step = steps[-1] if steps else "Step 1"
+    names: list[str] = []
+    for cell in tables_of(cells, "Variables in the Equation"):
+        if len(cell.row) >= 2 and cell.row[0] == step and cell.row[1] not in names:
+            names.append(cell.row[1])
+    coefficients = []
+    for name in names:
+        coefficients.append(
+            {
+                "name": name,
+                "B": lookup(cells, "Variables in the Equation", (step, name, "B")),
+                "se": lookup(cells, "Variables in the Equation", (step, name, "S.E.")),
+                "wald": lookup(cells, "Variables in the Equation", (step, name, "Wald")),
+                "df": lookup(cells, "Variables in the Equation", (step, name, "df")),
+                "p": lookup(cells, "Variables in the Equation", (step, name, "Sig.")),
+                "exp_b": lookup(cells, "Variables in the Equation", (step, name, "Exp(B)")),
+            }
+        )
+    return {
+        "chi2": lookup(cells, "Omnibus Tests of Model Coefficients", ("Model", "Chi-square")),
+        "df": lookup(cells, "Omnibus Tests of Model Coefficients", ("Model", "df")),
+        "p": lookup(cells, "Omnibus Tests of Model Coefficients", ("Model", "Sig.")),
+        "neg2ll": lookup(cells, "Model Summary", ("-2 Log likelihood",)),
+        "cox": lookup(cells, "Model Summary", ("Cox & Snell R Square",)),
+        "nagelkerke": lookup(cells, "Model Summary", ("Nagelkerke R Square",)),
+        "coefficients": coefficients,
     }

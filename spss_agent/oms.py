@@ -17,6 +17,7 @@ class Cell:
     col: tuple[str, ...]
     number: float | None
     text: str
+    pivot: str = ""
 
 
 def _local(tag: str) -> str:
@@ -40,12 +41,12 @@ def _number(cell: ET.Element) -> float | None:
         return None
 
 
-def _walk(elem: ET.Element, row: tuple[str, ...], col: tuple[str, ...], axis: str, command: str, table: str, out: list[Cell]) -> None:
+def _walk(elem: ET.Element, row: tuple[str, ...], col: tuple[str, ...], axis: str, command: str, table: str, pivot: str, out: list[Cell]) -> None:
     tag = _local(elem.tag)
     if tag == "dimension":
         axis = elem.get("axis") or axis
         for child in list(elem):
-            _walk(child, row, col, axis, command, table, out)
+            _walk(child, row, col, axis, command, table, pivot, out)
         return
     if tag in ("category", "group"):
         label = _label(elem)
@@ -54,7 +55,7 @@ def _walk(elem: ET.Element, row: tuple[str, ...], col: tuple[str, ...], axis: st
         else:
             row = row + (label,)
         for child in list(elem):
-            _walk(child, row, col, axis, command, table, out)
+            _walk(child, row, col, axis, command, table, pivot, out)
         return
     if tag == "cell":
         out.append(
@@ -65,11 +66,12 @@ def _walk(elem: ET.Element, row: tuple[str, ...], col: tuple[str, ...], axis: st
                 col=col,
                 number=_number(elem),
                 text=elem.get("text") or "",
+                pivot=pivot,
             )
         )
         return
     for child in list(elem):
-        _walk(child, row, col, axis, command, table, out)
+        _walk(child, row, col, axis, command, table, pivot, out)
 
 
 def parse_oms(path: Path) -> list[Cell]:
@@ -84,8 +86,9 @@ def parse_oms(path: Path) -> list[Cell]:
         for table in command.iter():
             if _local(table.tag) != "pivotTable":
                 continue
-            subtype = table.get("subType") or table.get("text") or ""
-            _walk(table, (), (), "row", command_name, subtype, cells)
+            subtype = table.get("subType") or ""
+            pivot = table.get("text") or ""
+            _walk(table, (), (), "row", command_name, subtype, pivot, cells)
     return cells
 
 
